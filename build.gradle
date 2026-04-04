@@ -1,0 +1,223 @@
+import java.nio.file.Files
+import java.nio.file.LinkOption
+
+buildscript {
+    repositories {
+        maven {
+            name = 'Fabric'
+            url = 'https://maven.fabricmc.net/'
+        }
+        mavenCentral()
+    }
+    dependencies {
+        classpath "net.fabricmc:fabric-loom:${loom_version}"
+    }
+}
+
+apply plugin: 'fabric-loom'
+apply plugin: 'maven-publish'
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+    archivesName = project.archives_name
+}
+
+repositories {
+    exclusiveContent {
+        forRepository {
+            maven {
+                name = 'Modrinth'
+                url = 'https://api.modrinth.com/maven'
+            }
+        }
+        filter {
+            includeGroup 'maven.modrinth'
+        }
+    }
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${minecraft_version}"
+    mappings "net.fabricmc:yarn:${yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${fabric_loader_version}"
+    modRuntimeOnly "net.fabricmc.fabric-api:fabric-api:${fabric_api_version}"
+
+    modRuntimeOnly "maven.modrinth:sodium:${sodium_version}"
+    modRuntimeOnly "maven.modrinth:iris:${iris_version}"
+
+    runtimeOnly "org.anarres:jcpp:${jcpp_version}"
+    runtimeOnly "io.github.douira:glsl-transformer:${glsl_transformer_version}"
+    runtimeOnly "org.antlr:antlr4-runtime:${antlr4_runtime_version}"
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+
+    withSourcesJar()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 21
+}
+
+def shaderpackDevName = "${archives_name}-dev"
+def shaderSourceDir = layout.projectDirectory.dir('shaders')
+def shaderpackRunDir = layout.projectDirectory.dir("run/shaderpacks/${shaderpackDevName}")
+def linkedShaderSourceDir = shaderpackRunDir.dir('shaders')
+def shaderpackMetadataFiles = fileTree(projectDir) {
+    include 'shaders.properties'
+    include 'pack.mcmeta'
+    include 'lang/**'
+    include 'LICENSE*'
+}
+def isWindows = System.getProperty('os.name').toLowerCase().contains('windows')
+def shaderpackIncludes = copySpec {
+    from(projectDir) {
+        include 'shaders/**'
+        include 'shaders.properties'
+        include 'pack.mcmeta'
+        include 'lang/**'
+        include 'LICENSE*'
+    }
+}
+def shaderpackStaticIncludes = copySpec {
+    from(projectDir) {
+        include 'shaders.properties'
+        include 'pack.mcmeta'
+        include 'lang/**'
+        include 'LICENSE*'
+    }
+}
+
+tasks.register('syncShaderpack', Sync) {
+    group = 'shaderpack'
+    description = 'Copies the full shaderpack into the development run directory.'
+    into(shaderpackRunDir)
+    with(shaderpackIncludes)
+
+    doFirst {
+        delete(shaderpackRunDir.asFile)
+    }
+}
+
+tasks.register('watchShaderpack') {
+    group = 'shaderpack'
+    description = 'Continuously syncs the full shaderpack into the development run directory when used with --continuous.'
+    dependsOn tasks.named('syncShaderpack')
+}
+
+tasks.register('syncShaderpackMetadata', Sync) {
+    group = 'shaderpack'
+    description = 'Copies non-shaderpack-source metadata into the development run directory.'
+    into(shaderpackRunDir)
+    with(shaderpackStaticIncludes)
+}
+
+tasks.register('linkShaderpackShaders') {
+    group = 'shaderpack'
+    description = 'Links run/shaderpacks/.../shaders back to the repository shaders directory for live editing.'
+    dependsOn tasks.named('syncShaderpackMetadata')
+    inputs.dir(shaderSourceDir)
+    outputs.dir(linkedShaderSourceDir)
+
+    doLast {
+        def sourceDir = shaderSourceDir.asFile.absoluteFile
+        def linkDir = linkedShaderSourceDir.asFile.absoluteFile
+        linkDir.parentFile.mkdirs()
+
+        if (isWindows) {
+            exec {
+                commandLine 'cmd', '/c', "if exist \"${linkDir}\" rmdir /S /Q \"${linkDir}\""
+                ignoreExitValue = true
+            }
+            exec {
+                commandLine 'cmd', '/c', 'mklink', '/J', linkDir.absolutePath, sourceDir.absolutePath
+            }
+        } else {
+            def linkPath = linkDir.toPath()
+            if (Files.exists(linkPath, LinkOption.NOFOLLOW_LINKS)) {
+                delete(linkDir)
+            }
+            Files.createSymbolicLink(linkPath, sourceDir.toPath())
+        }
+    }
+}
+
+tasks.register('zipShaderpack', Zip) {
+    group = 'shaderpack'
+    description = 'Packages the shaderpack into a release zip.'
+    destinationDirectory = layout.buildDirectory.dir('releases')
+    archiveBaseName = archives_name
+    archiveVersion = mod_version
+    archiveClassifier = 'shaderpack'
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+    with(shaderpackIncludes)
+}
+
+tasks.register('prepareShaderDevClient') {
+    group = 'shaderpack'
+    description = 'Stages the shaderpack and Iris config for the development client.'
+    dependsOn tasks.named('linkShaderpackShaders')
+    inputs.dir(shaderSourceDir)
+    inputs.files(shaderpackMetadataFiles)
+    inputs.property 'shaderpackName', shaderpackDevName
+    outputs.file layout.projectDirectory.file('run/config/iris.properties')
+
+    doLast {
+        def configDir = layout.projectDirectory.dir('run/config').asFile
+        configDir.mkdirs()
+
+        def irisConfig = new File(configDir, 'iris.properties')
+        def properties = new Properties()
+        if (irisConfig.exists()) {
+            irisConfig.withInputStream { properties.load(it) }
+        }
+
+        properties.setProperty('enableShaders', 'true')
+        properties.setProperty('enableDebugOptions', 'true')
+        properties.setProperty('shaderPack', shaderpackDevName)
+
+        irisConfig.withOutputStream { properties.store(it, 'Generated by Gradle for shader development') }
+    }
+}
+
+loom {
+    runConfigs.configureEach {
+        ideConfigGenerated = true
+        runDir = 'run'
+        vmArgs '-Dfabric.log.disableAnsi=false'
+    }
+
+    runs {
+        shaderClient {
+            inherit client
+            configName = 'Shader Dev Client'
+            source = sourceSets.main
+        }
+
+        shaderDebugClient {
+            inherit shaderClient
+            configName = 'Shader Dev Client (Debug)'
+            property 'fabric.log.level', 'debug'
+            vmArgs '-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=5005'
+        }
+    }
+}
+
+tasks.named('runShaderClient').configure {
+    dependsOn tasks.named('prepareShaderDevClient')
+}
+
+tasks.named('runShaderDebugClient').configure {
+    dependsOn tasks.named('prepareShaderDevClient')
+}
+
+tasks.named('assemble').configure {
+    dependsOn tasks.named('zipShaderpack')
+}

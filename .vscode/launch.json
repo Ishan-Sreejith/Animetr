@@ -1,0 +1,11 @@
+{
+    "configurations": [
+        {
+            "name": "Launch Minecraft",
+            "type": "node-terminal",
+            "command": "gradlew runShaderClient",
+            "request": "launch",
+            "internalConsoleOptions": "neverOpen"
+        }
+    ]
+}
